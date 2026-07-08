@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+build/
+dist/
+dist.noindex/
+.pytest_cache/
+# 使用者本機設定與快取（M3 產生）
+config.json
+# 內部開發文件（僅本地，不公開）
+CLAUDE.md
+PLAN.md
+PROGRESS.md
+NOTES.md
