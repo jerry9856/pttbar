@@ -17,9 +17,11 @@ import webbrowser
 from collections import deque
 
 import rumps
+import objc
 from AppKit import (
     NSAlert,
     NSAlertFirstButtonReturn,
+    NSApp,
     NSAttributedString,
     NSBezierPath,
     NSButton,
@@ -30,6 +32,8 @@ from AppKit import (
     NSGraphicsContext,
     NSImage,
     NSImageOnly,
+    NSMenu,
+    NSMenuItem,
     NSNoImage,
     NSSecureTextField,
     NSStatusBar,
@@ -37,6 +41,7 @@ from AppKit import (
     NSTextField,
     NSView,
 )
+from Foundation import NSObject
 
 from credentials import (
     acquire_single_instance_lock,
@@ -122,6 +127,10 @@ _CHAT_OPACITY = (0.3, 0.9, 1.0)    # 背景透明度（視窗底色 alpha）
 _CHAT_PAGE = 150                   # 開啟/展開時先渲染的最近則數
 _CHAT_MORE = 120                   # 上滑載入更多，每次往回補的則數
 
+# Demo 展示模式（錄製 README 畫面用）：輪播最近則數，與每則捲完後的停留秒數
+_DEMO_COUNT = 10
+_DEMO_HOLD = 1.5
+
 
 def _type_colors(theme: str = "ios"):
     """推/→/噓 的 (膠囊底色, 文字色)。色票資料在 ui_util.PILL_PALETTES（F5 可選主題）。"""
@@ -129,6 +138,29 @@ def _type_colors(theme: str = "ios"):
         return NSColor.colorWithSRGBRed_green_blue_alpha_(*rgba)
     palette = get_palette(theme)["colors"]
     return {sym: (c(bg), c(fg)) for sym, (bg, fg) in palette.items()}
+
+
+class _MenuTarget(NSObject):
+    """隱形主選單（Cmd+Q / Cmd+W）的 action target。"""
+
+    def initWithApp_(self, app):
+        self = objc.super(_MenuTarget, self).init()
+        if self is None:
+            return None
+        self._app = app
+        return self
+
+    def pttbarQuit_(self, _sender):
+        try:
+            self._app._quit()
+        except Exception:
+            rumps.quit_application()   # 清理失敗也要能結束
+
+    def pttbarCloseWindow_(self, _sender):
+        try:
+            self._app._close_key_window()
+        except Exception:
+            pass
 
 
 class _State:
@@ -195,6 +227,12 @@ class PTTBarApp(rumps.App):
         self._chat_needs_reset = False   # 下一輪 tick 要用 history 重繪聊天室
         self._chat_fed = 0     # 已餵給聊天室的 history 則數（append 指標）
         self._chat_oldest = 0  # 聊天室目前顯示到的最舊 history 位置（往上載入用）
+
+        # Demo 展示模式（錄製畫面用）：非空=展示中。快照最近推文循環輪播給
+        # 跑馬燈/彈幕/聊天室；只影響顯示層，不動 watcher、不寫入歷史與 config。
+        self._demo_items: list = []   # CommentData 快照（舊→新，最多 _DEMO_COUNT 則）
+        self._demo_idx = -1           # 目前輪播到哪一則；-1=尚未播出第一則
+        self._demo_next = 0.0         # 下一次換則的 time.monotonic() 門檻
 
         # 最後收到的推文「原始序號」（合併判斷用：接續段序號必須相連）；換文章時歸零
         self._last_raw_index: int | None = None
@@ -361,6 +399,9 @@ class PTTBarApp(rumps.App):
         if structure_changed:
             self._rebuild_menu()
 
+        # Demo 展示模式：時間到就輪播下一則（跑馬燈經由 _display_comment 取當前展示則）
+        self._demo_tick()
+
         # 每一步都推進跑馬燈（內容有變會自動重建捲動影格）
         self._advance_marquee()
 
@@ -386,6 +427,8 @@ class PTTBarApp(rumps.App):
     # ================= 啟動流程 =================
 
     def _bootstrap(self):
+        self._install_main_menu()   # 先裝，登入對話框開著時快捷鍵就要能用
+
         ptt_id = get_ptt_id()
         password = get_password(ptt_id) if ptt_id else None
 
@@ -399,6 +442,58 @@ class PTTBarApp(rumps.App):
         self._danmaku_sync()   # 上次開著彈幕 → 重開自動恢復
         self._chat_sync()      # 上次開著聊天室 → 重開自動恢復（含收合狀態）
         self._rebuild_menu()  # 狀態列標題由跑馬燈（_advance_marquee）每步自動更新
+
+    def _install_main_menu(self):
+        """裝一個「隱形」主選單。LSUIElement app 沒有選單列可看，但 Cmd+Q/Cmd+W/
+        Cmd+C 這些快捷鍵是靠主選單的 key equivalent 路由的——沒裝就全部無效
+        （使用者回報）。選單永遠不會顯示，純粹讓快捷鍵活起來。"""
+        try:
+            NSApp.setMainMenu_(self._build_main_menu())
+        except Exception:
+            pass   # 沒有主選單只是快捷鍵無效，不影響其他功能
+
+    def _build_main_menu(self):
+        self._menu_target = t = _MenuTarget.alloc().initWithApp_(self)
+        main = NSMenu.alloc().init()
+
+        def submenu(title, entries):
+            holder = NSMenuItem.alloc().init()
+            menu = NSMenu.alloc().initWithTitle_(title)
+            for label, sel, key, target in entries:
+                mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    label, sel, key)
+                if target is not None:
+                    mi.setTarget_(target)
+                menu.addItem_(mi)
+            holder.setSubmenu_(menu)
+            main.addItem_(holder)
+
+        submenu("PTTBar", [
+            ("關閉視窗", "pttbarCloseWindow:", "w", t),
+            ("結束 PTTBar", "pttbarQuit:", "q", t),
+        ])
+        # target=None 走 responder chain → WKWebView 的輸入框才有 Cmd+C/V/A 可用
+        submenu("編輯", [
+            ("復原", "undo:", "z", None),
+            ("重做", "redo:", "Z", None),   # 大寫 = Cmd+Shift+Z
+            ("剪下", "cut:", "x", None),
+            ("拷貝", "copy:", "c", None),
+            ("貼上", "paste:", "v", None),
+            ("全選", "selectAll:", "a", None),
+        ])
+        return main
+
+    def _close_key_window(self):
+        """Cmd+W：主視窗＝隱藏（同紅色關閉鈕）；聊天室＝收合成小 icon
+        （真的關掉會與 chat_on 狀態不一致）。其他視窗不動。"""
+        kw = NSApp.keyWindow()
+        if kw is None:
+            return
+        if self.gui and getattr(self.gui, "_win", None) == kw:
+            kw.orderOut_(None)
+            return
+        if self._chat is not None and getattr(self._chat, "_win", None) == kw:
+            self._collapse_chat(True)
 
     def _resume_tracking(self):
         """開始追蹤 config 裡記住的文章（bootstrap / 原帳號重新登入共用）。"""
@@ -528,6 +623,7 @@ class PTTBarApp(rumps.App):
         """共用的「開始追蹤某文章」：清空狀態、存 config、交給 watcher。aid 或 index 擇一。"""
         self.state.comments.clear()
         self._history.clear()   # 視窗 feed/歷史/統計只顯示「這一篇」的推文，不混到上一篇
+        self._stop_demo()       # 換文章 → 舊文章的輪播快照沒意義了
         self._chat_fed = 0
         self._chat_oldest = 0
         self._chat_needs_reset = True   # 換文章 → 聊天室清空重繪
@@ -1028,6 +1124,53 @@ class PTTBarApp(rumps.App):
     def _toggle_chat_collapsed(self, _sender=None):
         self._collapse_chat(not self.chat_collapsed)
 
+    # ---- Demo 展示模式（錄製 README 畫面用）----
+
+    def _toggle_demo(self, _sender=None):
+        """輪播最近 _DEMO_COUNT 則推文給跑馬燈/彈幕/聊天室，方便錄製展示畫面。
+        只影響顯示層：不動 watcher、不寫入推文歷史與 config；關閉即回到即時內容。"""
+        if self._demo_items:
+            self._stop_demo()
+        else:
+            items = list(self.state.comments)[-_DEMO_COUNT:]
+            if not items:
+                self._toast = ("還沒有推文，無法展示", time.monotonic())
+                self._gui_dirty = True
+                return
+            self._demo_items = items
+            self._demo_idx = -1
+            self._demo_next = 0.0   # 立即播出第一則
+        self._rebuild_menu()
+
+    def _stop_demo(self):
+        self._demo_items = []
+        self._demo_idx = -1
+        if self.chat_on:
+            self._chat_needs_reset = True   # 聊天室重繪回真實 history，清掉輪播訊息
+
+    def _demo_tick(self):
+        """展示中：跑馬燈捲完目前這則、停留 _DEMO_HOLD 秒後輪到下一則（循環）。
+        每換一則就餵給彈幕與聊天室（有開才收；聊天室走直接 append，不碰 history）。"""
+        if not self._demo_items:
+            return
+        now = time.monotonic()
+        if self._demo_idx >= 0:
+            if not self._at_end:
+                self._demo_next = now + _DEMO_HOLD   # 還在捲：停留計時往後延
+                return
+            if now < self._demo_next:
+                return
+        self._demo_idx = (self._demo_idx + 1) % len(self._demo_items)
+        self._demo_next = now + _DEMO_HOLD
+        c = self._demo_items[self._demo_idx]
+        self._danmaku_feed(c.type, c.author, c.content)
+        if self.chat_on and self._chat is not None and not self.chat_collapsed:
+            try:
+                self._chat.append([self._chat_msg(
+                    {"t": c.type, "a": c.author, "c": c.content, "tm": c.time})])
+            except Exception:
+                self._chat = None   # 聊天室壞掉只停用自己，不拖垮 app
+
     def _reconnect(self, _sender=None):
         """立即重新連線：解除停止/退避、馬上重連（連線問題本來就會自動重試，
         這個是讓使用者不必枯等退避的手動加速；帳密錯誤則等重設帳密）。"""
@@ -1064,6 +1207,7 @@ class PTTBarApp(rumps.App):
         if ptt_id:
             clear_password(ptt_id)
         clear_all()
+        self._stop_demo()
         self.state = _State()
         self._favorites = []
         self._browse_board = None
@@ -1124,7 +1268,10 @@ class PTTBarApp(rumps.App):
         return f"{star}[{c.type}] {c.author}: {c.content}"
 
     def _display_comment(self):
-        """狀態列要顯示的那則推文。關鍵字過濾開啟時，取最新「含關鍵字」的一則。"""
+        """狀態列要顯示的那則推文。關鍵字過濾開啟時，取最新「含關鍵字」的一則。
+        Demo 展示中則回傳目前輪播到的那則（不受關鍵字過濾影響）。"""
+        if self._demo_items:
+            return self._demo_items[self._demo_idx]   # idx=-1 時是最後一則，同 tick 內就會輪到第一則
         if not self.state.comments:
             return None
         if self.keyword_filter and self.keywords:
@@ -1367,6 +1514,10 @@ class PTTBarApp(rumps.App):
             items.append(rumps.MenuItem(
                 "展開聊天室" if self.chat_collapsed else "收合聊天室",
                 callback=self._toggle_chat_collapsed))
+        if self.state.comments or self._demo_items:
+            items.append(rumps.MenuItem(
+                "停止 Demo 展示" if self._demo_items else "Demo 展示（輪播最近推文）",
+                callback=self._toggle_demo))
         items.append(rumps.MenuItem("追蹤新文章…", callback=self._track_new))
         if self._article_url():
             items.append(rumps.MenuItem("在瀏覽器開啟文章", callback=self._open_in_browser))

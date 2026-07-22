@@ -13,7 +13,9 @@ from AppKit import (
     NSApp,
     NSBackingStoreBuffered,
     NSMakeRect,
+    NSView,
     NSViewHeightSizable,
+    NSViewMinYMargin,
     NSViewWidthSizable,
     NSVisualEffectBlendingModeBehindWindow,
     NSVisualEffectView,
@@ -58,6 +60,21 @@ class _WinDelegate(NSObject):
     def windowShouldClose_(self, sender):
         sender.orderOut_(None)
         return False
+
+
+class _DragStrip(NSView):
+    """透明拖曳帶，蓋在 webview 之上的標題列區域。
+
+    FullSizeContentView 讓 WKWebView 延伸到標題列底下，而 WKWebView 會吃掉滑鼠事件
+    （mouseDownCanMoveWindow=NO）→ 整個視窗沒有可拖曳的地方。這條原生 view 疊在最上層
+    接住標題列高度內的 mouseDown、交給系統做原生視窗拖移；紅綠燈在更上層的
+    titlebar container，不受影響。"""
+
+    def mouseDown_(self, event):
+        try:
+            self.window().performWindowDragWithEvent_(event)
+        except Exception:
+            pass
 
 
 class GuiWindow:
@@ -116,6 +133,22 @@ class GuiWindow:
         html = HTML.replace('<html lang="zh-Hant">',
                             '<html lang="zh-Hant" class="glass">') if glass else HTML
         web.loadHTMLString_baseURL_(html, None)
+
+        if glass:
+            # FullSizeContentView 模式下 webview 蓋住標題列 → 疊一條拖曳帶恢復拖移。
+            # 高度取實際標題列高（contentView 高 - contentLayoutRect 高）；失敗退 28px。
+            try:
+                b = win.contentView().bounds()
+                strip_h = float(b.size.height - win.contentLayoutRect().size.height)
+                if not (0.0 < strip_h <= 60.0):
+                    strip_h = 28.0
+                strip = _DragStrip.alloc().initWithFrame_(NSMakeRect(
+                    0.0, b.size.height - strip_h, b.size.width, strip_h))
+                strip.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+                win.contentView().addSubview_(strip)   # 在 webview 之後加入 = 蓋在其上
+            except Exception:
+                pass   # 拖曳帶失敗只是不能拖，不影響其他功能
+
         win.center()
         self._win, self._web = win, web
 
