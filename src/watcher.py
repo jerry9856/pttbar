@@ -34,10 +34,12 @@ import PyPtt.connect_core as _connect_core
 import PyPtt.log as _pyptt_log
 
 import fav_parse
+import ptt_compat
 import raw_parse
 import web_fetch
 
 fav_parse.install()   # 修 PyPtt 我的最愛解析（看板名第一字被切，見 NOTES.md）
+ptt_compat.install()  # 修 PyPtt 認不出新版 PTT 主選單狀態列（登入永遠失敗，見 NOTES.md）
 
 # --- 消音 PyPtt 的 [INFO] 訊息（workaround，見 NOTES.md）---
 # 光給 API(log_level=SILENT) 沒用：_api_get_board_info.py 每次抓文都呼叫 log.init(log.INFO)，
@@ -519,9 +521,10 @@ class PttWatcher:
             ptt.login(self._id, self._pw, kick_other_session=True)
             self._emit(EVT_STATUS, "● 已登入")
             return True
-        except (PyPtt.LoginError, PyPtt.WrongIDorPassword, PyPtt.WrongPassword,
-                PyPtt.UnregisteredUser):
-            # 帳密錯誤：重連也沒用，直接停止
+        except (PyPtt.WrongIDorPassword, PyPtt.WrongPassword, PyPtt.UnregisteredUser):
+            # 帳密錯誤：重連也沒用，直接停止。
+            # 注意 LoginError 不在此列：它只代表「登入後畫面不是主選單」（逾時/系統過載/
+            # PTT 改版認不出畫面），不是帳密錯 → 走下面的退避重連並顯示例外名稱。
             self._emit(EVT_ERROR, "登入失敗：帳號或密碼錯誤")
             self._enter_halted("登入失敗，請重新設定帳密")
             return False

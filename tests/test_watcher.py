@@ -870,3 +870,33 @@ def test_poll_interval_follows_module_patch(monkeypatch):
     w = PttWatcher("id", "pw", q)
     monkeypatch.setattr(watcher_mod, "POLL_INTERVAL", 0.05)
     assert w.poll_interval == 0.05
+
+
+def test_generic_login_error_retries_not_halts(fast, monkeypatch):
+    """LoginError（登入後畫面不是主選單，如 PTT 改版/系統過載）不是帳密錯 → 不可顯示帳密錯誤、
+    不進 halted，走退避重連。"""
+    class FlakyLoginAPI(FakeAPI):
+        def login(self, ptt_id, ptt_pw, kick_other_session=False):
+            super().login(ptt_id, ptt_pw, kick_other_session)
+            raise _raise(PyPtt.LoginError)
+
+    fake = FlakyLoginAPI([_post(_mk_comments(1))])
+    monkeypatch.setattr(watcher_mod.PyPtt, "API", lambda *a, **k: fake)
+
+    q: queue.Queue = queue.Queue()
+    w = PttWatcher("id", "pw", q)
+    w.start()
+    w.track("Test", "#12345678")
+    events = []
+    try:
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            try:
+                events.append(q.get(timeout=0.05))
+            except queue.Empty:
+                continue
+    finally:
+        w.stop()
+    texts = [str(p) for _t, p in events]
+    assert any("LoginError" in t and "重連" in t for t in texts)
+    assert not any("帳號或密碼錯誤" in t or "重新設定帳密" in t for t in texts)
